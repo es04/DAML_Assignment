@@ -100,7 +100,7 @@ def load_cmapss(data_dir=CMAPSS_DIR, subset=CMAPSS_SUBSET):
     test_df = pd.read_csv(test_path, sep=r"\s+", header=None)
     train_df.columns = CMAPSS_COLS
     test_df.columns = CMAPSS_COLS
-    
+
     rul_test = pd.read_csv(rul_path, header=None).values.flatten()
 
     # Drop trailing NaN columns caused by extra spaces
@@ -1111,7 +1111,7 @@ def train_ppo_scheduler(total_timesteps=500_000, n_envs=4):
 
     print(f"\n  Training PPO: {total_timesteps:,} steps | {n_envs} envs")
     model.learn(
-        total_timesteps=total_timesteps, callback=[eval_cb, ckpt_cb], progress_bar=True
+        total_timesteps=total_timesteps, callback=[eval_cb, ckpt_cb], progress_bar=False
     )
     model.save("models/ppo_scheduler")
     print("  PPO saved → models/ppo_scheduler.zip")

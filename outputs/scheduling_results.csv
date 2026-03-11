@@ -1,0 +1,5 @@
+,mean_reward,mean_failures,mean_tardiness
+Reactive + Static,-214.67520065124958,4.74,1673.5184372831345
+Predictive Maintenance Only,-124.4028082124057,0.43,1757.1725665913389
+Scheduling Optimisation Only,-46.62122834805262,4.25,201.0102362337719
+Proposed DRL-PPO (Integrated),-136.08115585627738,0.49,1872.6115585627738
