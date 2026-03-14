@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy import stats
 
 warnings.filterwarnings("ignore")
 
@@ -72,6 +73,14 @@ DROP_SENSORS = ["s_1", "s_5", "s_6", "s_10", "s_16", "s_18", "s_19"]
 RUL_CLIP = 125
 WINDOW_SIZE = 30  # sliding window length for sequence models
 STRIDE = 1  # sliding window stride
+
+# Quick-mode overrides (activated via --quick flag)
+QUICK_MODE = False
+EPOCHS_CLF = 40  # BiLSTM classifier epochs
+EPOCHS_RUL = 60  # RUL baseline epochs
+EPOCHS_PROP = 80  # Proposed CNN-LSTM-Attention epochs
+PPO_STEPS = 500_000
+PPO_N_ENVS = 4
 
 # AI4I columns to drop (IDs + individual failure sub-types)
 AI4I_DROP = ["UDI", "Product ID", "TWF", "HDF", "PWF", "OSF", "RNF"]
@@ -348,6 +357,76 @@ def evaluate_classifier(name, y_true, y_prob, threshold=0.5):
     return {"model": name, "accuracy": acc, "f1": f1, "auc": auc}
 
 
+def significance_test_classifiers(
+    probas,
+    y_true,
+    proposed_key,
+    baseline_keys,
+    save_path="outputs/clf_significance.csv",
+):
+    """
+    Wilcoxon signed-rank test comparing proposed model against each baseline.
+    Uses per-sample squared error as the paired observation.
+    """
+    rows = []
+    prop_err = (probas[proposed_key] - y_true) ** 2
+    for key in baseline_keys:
+        base_err = (probas[key] - y_true) ** 2
+        stat, p = stats.wilcoxon(prop_err, base_err, alternative="less")
+        rows.append(
+            {
+                "baseline": key,
+                "proposed": proposed_key,
+                "W_statistic": round(stat, 4),
+                "p_value": round(p, 6),
+                "significant": "Yes" if p < 0.05 else "No",
+            }
+        )
+        print(
+            f"  Wilcoxon [{proposed_key} vs {key}]: W={stat:.2f}, p={p:.6f} "
+            f"({'✓ significant' if p < 0.05 else '✗ not significant'})"
+        )
+    df = pd.DataFrame(rows)
+    df.to_csv(save_path, index=False)
+    print(f"  Significance tests → {save_path}")
+    return df
+
+
+def significance_test_rul(
+    all_preds,
+    y_true,
+    proposed_key,
+    baseline_keys,
+    save_path="outputs/rul_significance.csv",
+):
+    """
+    Wilcoxon signed-rank test comparing proposed RUL model against each baseline.
+    Uses per-sample absolute error as the paired observation.
+    """
+    rows = []
+    prop_err = np.abs(all_preds[proposed_key] - y_true)
+    for key in baseline_keys:
+        base_err = np.abs(all_preds[key] - y_true)
+        stat, p = stats.wilcoxon(prop_err, base_err, alternative="less")
+        rows.append(
+            {
+                "baseline": key,
+                "proposed": proposed_key,
+                "W_statistic": round(stat, 4),
+                "p_value": round(p, 6),
+                "significant": "Yes" if p < 0.05 else "No",
+            }
+        )
+        print(
+            f"  Wilcoxon [{proposed_key} vs {key}]: W={stat:.2f}, p={p:.6f} "
+            f"({'✓ significant' if p < 0.05 else '✗ not significant'})"
+        )
+    df = pd.DataFrame(rows)
+    df.to_csv(save_path, index=False)
+    print(f"  Significance tests → {save_path}")
+    return df
+
+
 def plot_roc_curves(results, y_true, probas, save_path="outputs/roc_curves.png"):
     fig, ax = plt.subplots(figsize=(9, 7))
     colors = ["grey", "steelblue", "darkorange", "green", "crimson"]
@@ -437,7 +516,7 @@ def run_classification_pipeline():
     # Baseline 4: Bidirectional LSTM
     print("\n[5/6] BiLSTM …")
     lstm_model = train_bilstm_classifier(
-        X_tr, y_tr, X_val, y_val, input_dim=n_features, epochs=40
+        X_tr, y_tr, X_val, y_val, input_dim=n_features, epochs=EPOCHS_CLF
     )
     lstm_prob = lstm_model.predict_proba_np(X_test)
     results.append(evaluate_classifier("BiLSTM", y_test, lstm_prob))
@@ -473,7 +552,12 @@ def run_classification_pipeline():
 
         # LSTM fold model
         lstm_f = train_bilstm_classifier(
-            Xf_tr, yf_tr, Xf_oof, yf_oof, input_dim=n_features, epochs=20
+            Xf_tr,
+            yf_tr,
+            Xf_oof,
+            yf_oof,
+            input_dim=n_features,
+            epochs=max(EPOCHS_CLF // 2, 5),
         )
         oof_lstm[oof_idx] = lstm_f.predict_proba_np(Xf_oof)
         print(f"    Fold {fold+1}/5 done")
@@ -498,6 +582,15 @@ def run_classification_pipeline():
         "outputs/classification_results.csv"
     )
     plot_roc_curves(results, y_test, probas)
+
+    # Statistical significance: proposed vs all baselines
+    print("\n── Classification Significance Tests ───────────────────────────")
+    significance_test_classifiers(
+        probas,
+        y_test,
+        proposed_key="Hybrid XGBoost-LSTM (Proposed)",
+        baseline_keys=["Logistic Regression", "Random Forest", "XGBoost", "BiLSTM"],
+    )
 
     # Confusion matrix for the proposed model
     hybrid_pred = (hybrid_prob >= 0.5).astype(int)
@@ -781,28 +874,28 @@ def run_rul_pipeline():
     # Baseline 1: LSTM
     print("\n[2/6] LSTM baseline …")
     lstm = LSTMRegressor(input_dim).to(DEVICE)
-    lstm = train_rul_model(lstm, X_tr, y_tr, X_val, y_val, epochs=60)
+    lstm = train_rul_model(lstm, X_tr, y_tr, X_val, y_val, epochs=EPOCHS_RUL)
     results.append(regression_metrics("LSTM", y_test, infer_rul(lstm, X_test)))
     torch.save(lstm.state_dict(), "models/rul_lstm.pt")
 
     # Baseline 2: GRU
     print("\n[3/6] GRU …")
     gru = GRURegressor(input_dim).to(DEVICE)
-    gru = train_rul_model(gru, X_tr, y_tr, X_val, y_val, epochs=60)
+    gru = train_rul_model(gru, X_tr, y_tr, X_val, y_val, epochs=EPOCHS_RUL)
     results.append(regression_metrics("GRU", y_test, infer_rul(gru, X_test)))
     torch.save(gru.state_dict(), "models/rul_gru.pt")
 
     # Baseline 3: CNN-LSTM
     print("\n[4/6] CNN-LSTM …")
     cnn_lstm = CNNLSTMRegressor(input_dim).to(DEVICE)
-    cnn_lstm = train_rul_model(cnn_lstm, X_tr, y_tr, X_val, y_val, epochs=60)
+    cnn_lstm = train_rul_model(cnn_lstm, X_tr, y_tr, X_val, y_val, epochs=EPOCHS_RUL)
     results.append(regression_metrics("CNN-LSTM", y_test, infer_rul(cnn_lstm, X_test)))
     torch.save(cnn_lstm.state_dict(), "models/rul_cnnlstm.pt")
 
     # Baseline 4: Attention-LSTM
     print("\n[5/6] Attention-LSTM …")
     attn_lstm = MultiHeadAttentionLSTM(input_dim).to(DEVICE)
-    attn_lstm = train_rul_model(attn_lstm, X_tr, y_tr, X_val, y_val, epochs=60)
+    attn_lstm = train_rul_model(attn_lstm, X_tr, y_tr, X_val, y_val, epochs=EPOCHS_RUL)
     results.append(
         regression_metrics("Attention-LSTM", y_test, infer_rul(attn_lstm, X_test))
     )
@@ -812,7 +905,7 @@ def run_rul_pipeline():
     print("\n[6/6] CNN-LSTM-Attention (proposed) …")
     proposed = CNNLSTMAttention(input_dim).to(DEVICE)
     proposed = train_rul_model(
-        proposed, X_tr, y_tr, X_val, y_val, epochs=80, returns_attn=True
+        proposed, X_tr, y_tr, X_val, y_val, epochs=EPOCHS_PROP, returns_attn=True
     )
     y_pred_proposed = infer_rul(proposed, X_test, returns_attn=True)
     results.append(
@@ -892,6 +985,68 @@ def run_rul_pipeline():
     plt.savefig("outputs/rul_prediction_plot.png", dpi=150)
     plt.close()
     print("  RUL plot → outputs/rul_prediction_plot.png")
+
+    # ── RUL trajectory plot: true vs predicted for sample engine units ────────
+    all_preds = {
+        "LSTM": infer_rul(lstm, X_test),
+        "GRU": infer_rul(gru, X_test),
+        "CNN-LSTM": infer_rul(cnn_lstm, X_test),
+        "Attention-LSTM": infer_rul(attn_lstm, X_test),
+        "CNN-LSTM-Attention (Proposed)": y_pred_proposed,
+        "Hybrid XGBoost-LSTM-Att. (Proposed)": y_pred_hybrid,
+    }
+
+    # Plot predicted vs true RUL for first 6 engine units (sorted by unit index)
+    n_units = min(6, len(y_test))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+    axes = axes.flatten()
+    colors_traj = ["grey", "steelblue", "darkorange", "purple", "crimson", "green"]
+    for idx in range(n_units):
+        ax = axes[idx]
+        ax.axhline(
+            y_test[idx], color="black", linewidth=2, linestyle="--", label="True RUL"
+        )
+        for (mname, preds), col in zip(all_preds.items(), colors_traj):
+            ax.bar(
+                list(all_preds.keys()).index(mname),
+                preds[idx],
+                color=col,
+                alpha=0.7,
+                width=0.6,
+            )
+        ax.set_title(f"Engine Unit {idx + 1}", fontsize=10)
+        ax.set_ylabel("RUL (cycles)")
+        ax.set_xticks(range(len(all_preds)))
+        ax.set_xticklabels(list(all_preds.keys()), rotation=30, ha="right", fontsize=7)
+        ax.grid(axis="y", alpha=0.3)
+    handles = [
+        plt.Line2D([0], [0], color="black", linestyle="--", lw=2, label="True RUL")
+    ]
+    fig.legend(handles=handles, loc="upper right", fontsize=9)
+    plt.suptitle(
+        "RUL Predictions per Engine Unit — Model Comparison",
+        fontweight="bold",
+        fontsize=13,
+    )
+    plt.tight_layout()
+    plt.savefig("outputs/rul_trajectory_plot.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  RUL trajectory plot → outputs/rul_trajectory_plot.png")
+
+    # Statistical significance: proposed hybrid vs baselines
+    print("\n── RUL Significance Tests ──────────────────────────────────────")
+    significance_test_rul(
+        all_preds,
+        y_test,
+        proposed_key="Hybrid XGBoost-LSTM-Att. (Proposed)",
+        baseline_keys=[
+            "LSTM",
+            "GRU",
+            "CNN-LSTM",
+            "Attention-LSTM",
+            "CNN-LSTM-Attention (Proposed)",
+        ],
+    )
 
     return results
 
@@ -1050,7 +1205,7 @@ class FactoryEnv(gym.Env):
 
 
 def run_baseline_policy(policy="reactive", n_episodes=50):
-    rewards, failures, tardiness = [], [], []
+    rewards, failures, tardiness, on_time_rates, downtime_pcts = [], [], [], [], []
     for _ in range(n_episodes):
         env = FactoryEnv(use_predictive=(policy == "pred_only"))
         obs, _ = env.reset()
@@ -1071,7 +1226,26 @@ def run_baseline_policy(policy="reactive", n_episodes=50):
         rewards.append(total_r)
         failures.append(env.failures)
         tardiness.append(env.tard)
-    return (np.mean(rewards), np.mean(failures), np.mean(tardiness))
+        # On-time rate: fraction of jobs completed without tardiness
+        n_jobs = len(env.done_jobs)
+        on_time = sum(
+            1
+            for j in env.done_jobs
+            if env.busy_until[j["type"] % env.N_MACHINES] <= j["due"]
+        )
+        on_time_rates.append(on_time / max(n_jobs, 1))
+        # Downtime %: total maint cycles / episode horizon
+        downtime_cycles = env.failures * env.MAINT_DUR * 2
+        downtime_pcts.append(downtime_cycles / env.MAX_TIME * 100)
+    return (
+        np.mean(rewards),
+        np.mean(failures),
+        np.mean(tardiness),
+        np.mean(on_time_rates),
+        np.mean(downtime_pcts),
+        rewards,
+        tardiness,
+    )
 
 
 # ── 5.3  PPO training ────────────────────────────────────────────────────────
@@ -1169,7 +1343,7 @@ def run_scheduling_pipeline():
     print(f"  Smoke test reward: {total_r:.2f} | " f"Failures: {env_test.failures}")
 
     # Train PPO — increase total_timesteps to 2_000_000 for full training
-    ppo_model = train_ppo_scheduler(total_timesteps=500_000, n_envs=4)
+    ppo_model = train_ppo_scheduler(total_timesteps=PPO_STEPS, n_envs=PPO_N_ENVS)
 
     # Evaluate all four strategies
     strategies = {
@@ -1180,12 +1354,24 @@ def run_scheduling_pipeline():
     all_results = {}
 
     for name, (policy, _) in strategies.items():
-        r, f, t = run_baseline_policy(policy, n_episodes=100)
-        all_results[name] = {"mean_reward": r, "mean_failures": f, "mean_tardiness": t}
-        print(f"  {name:<35} | R: {r:7.2f} | F: {f:.2f} | T: {t:.2f}")
+        r, f, t, otr, dtp, ep_r, ep_t = run_baseline_policy(policy, n_episodes=100)
+        # Schedule stability index: 1 - (std_tardiness / mean_tardiness)
+        ssi = 1 - (np.std(ep_t) / max(np.mean(ep_t), 1e-6))
+        all_results[name] = {
+            "mean_reward": r,
+            "mean_failures": f,
+            "mean_tardiness": t,
+            "on_time_rate_%": round(otr * 100, 2),
+            "downtime_%": round(dtp, 2),
+            "schedule_stability_index": round(ssi, 4),
+        }
+        print(
+            f"  {name:<35} | R: {r:7.2f} | F: {f:.2f} | T: {t:.2f} "
+            f"| OTR: {otr*100:.1f}% | DT: {dtp:.1f}% | SSI: {ssi:.3f}"
+        )
 
     # Evaluate PPO
-    ppo_r, ppo_f, ppo_t = [], [], []
+    ppo_r, ppo_f, ppo_t, ppo_otr, ppo_dtp = [], [], [], [], []
     for _ in range(100):
         env = FactoryEnv(use_predictive=True)
         obs, _ = env.reset()
@@ -1197,17 +1383,52 @@ def run_scheduling_pipeline():
         ppo_r.append(ep_r)
         ppo_f.append(env.failures)
         ppo_t.append(env.tard)
+        on_time = sum(
+            1
+            for j in env.done_jobs
+            if env.busy_until[j["type"] % env.N_MACHINES] <= j["due"]
+        )
+        ppo_otr.append(on_time / max(len(env.done_jobs), 1))
+        downtime_cycles = env.failures * env.MAINT_DUR * 2
+        ppo_dtp.append(downtime_cycles / env.MAX_TIME * 100)
 
+    ppo_ssi = 1 - (np.std(ppo_t) / max(np.mean(ppo_t), 1e-6))
     all_results["Proposed DRL-PPO (Integrated)"] = {
         "mean_reward": np.mean(ppo_r),
         "mean_failures": np.mean(ppo_f),
         "mean_tardiness": np.mean(ppo_t),
+        "on_time_rate_%": round(np.mean(ppo_otr) * 100, 2),
+        "downtime_%": round(np.mean(ppo_dtp), 2),
+        "schedule_stability_index": round(ppo_ssi, 4),
     }
     print(
         f"  {'Proposed DRL-PPO (Integrated)':<35} | "
         f"R: {np.mean(ppo_r):7.2f} | F: {np.mean(ppo_f):.2f} | "
-        f"T: {np.mean(ppo_t):.2f}"
+        f"T: {np.mean(ppo_t):.2f} | OTR: {np.mean(ppo_otr)*100:.1f}% | "
+        f"DT: {np.mean(ppo_dtp):.1f}% | SSI: {ppo_ssi:.3f}"
     )
+
+    # ── Statistical significance: PPO vs baselines (on reward) ───────────────
+    print("\n── Scheduling Significance Tests ───────────────────────────────")
+    sig_rows = []
+    for name, (policy, _) in strategies.items():
+        _, _, _, _, _, ep_r_base, _ = run_baseline_policy(policy, n_episodes=100)
+        stat, p = stats.wilcoxon(ppo_r, ep_r_base, alternative="greater")
+        sig_rows.append(
+            {
+                "baseline": name,
+                "proposed": "Proposed DRL-PPO (Integrated)",
+                "W_statistic": round(stat, 4),
+                "p_value": round(p, 6),
+                "significant": "Yes" if p < 0.05 else "No",
+            }
+        )
+        print(
+            f"  Wilcoxon [PPO vs {name}]: W={stat:.2f}, p={p:.6f} "
+            f"({'✓ significant' if p < 0.05 else '✗ not significant'})"
+        )
+    pd.DataFrame(sig_rows).to_csv("outputs/scheduling_significance.csv", index=False)
+    print("  Significance tests → outputs/scheduling_significance.csv")
 
     # Save and plot results
     df = pd.DataFrame(all_results).T
@@ -1263,6 +1484,12 @@ if __name__ == "__main__":
     # Override training lengths when --quick is used
     if args.quick:
         print("[QUICK MODE] Reducing epochs and RL steps for fast testing.")
+        QUICK_MODE = True
+        EPOCHS_CLF = 5
+        EPOCHS_RUL = 10
+        EPOCHS_PROP = 15
+        PPO_STEPS = 50_000
+        PPO_N_ENVS = 1
 
     wall_times = {}
 
