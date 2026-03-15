@@ -1,4 +1,4 @@
 baseline,proposed,W_statistic,p_value,significant
-Reactive + Static,Proposed DRL-PPO (Integrated),4046.0,0.0,Yes
-Predictive Maintenance Only,Proposed DRL-PPO (Integrated),503.0,1.0,No
+Reactive + Static,Proposed DRL-PPO (Integrated),3863.0,2e-06,Yes
+Predictive Maintenance Only,Proposed DRL-PPO (Integrated),782.0,1.0,No
 Scheduling Optimisation Only,Proposed DRL-PPO (Integrated),0.0,1.0,No

@@ -1,5 +1,5 @@
-,mean_reward,mean_failures,mean_tardiness,on_time_rate_%,downtime_%,schedule_stability_index
-Reactive + Static,-212.07471221409054,4.4,1681.188977744547,1.8,8.8,0.7285
-Predictive Maintenance Only,-128.4965696446448,0.5,1777.7656964464484,1.6,1.0,0.7788
-Scheduling Optimisation Only,-46.00251542694358,4.29,192.5209618911966,2.76,8.58,0.7793
-Proposed DRL-PPO (Integrated),-177.63844604719958,0.56,2303.984460471996,8.76,1.12,0.7944
+,mean_reward,mean_failures,mean_tardiness,on_time_rate_%,downtime_%,schedule_stability_index,mean_maint_cost,automation_success_rate_%,mean_latency_ms
+Reactive + Static,-208.50569835478703,4.36,1649.268098360283,2.42,8.72,0.7938,218.0,100.0,0.1278
+Predictive Maintenance Only,-116.70855431555403,0.59,1651.3855431555403,2.08,1.18,0.7899,575.3,99.9,0.1087
+Scheduling Optimisation Only,-46.724636975134835,4.36,192.7053081261236,3.52,8.72,0.7803,218.0,100.0,0.1083
+Proposed DRL-PPO (Integrated),-172.6710374216783,0.59,2236.7103742167824,9.76,1.18,0.7756,599.5,99.96,0.1663

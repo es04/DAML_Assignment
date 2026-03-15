@@ -1065,6 +1065,8 @@ class FactoryEnv(gym.Env):
     MAX_TIME = 500.0
     RUL_MAX = 125.0
     MAINT_DUR = 5  # cycles for a planned maintenance action
+    COST_REACTIVE = 50  # cost units per unplanned (reactive) maintenance event
+    COST_PROACTIVE = 20  # cost units per planned (proactive) maintenance event
 
     def __init__(self, failure_rate=0.02, n_jobs=50, use_predictive=True, seed=None):
         super().__init__()
@@ -1094,6 +1096,11 @@ class FactoryEnv(gym.Env):
         self.maint_done = np.zeros(self.N_MACHINES)
 
         self.done_jobs, self.t, self.tard, self.failures = [], 0.0, 0.0, 0
+        self.proactive_count = 0  # number of proactive maintenance actions
+        self.total_maint_cost = 0.0  # cumulative maintenance cost
+        self.valid_actions = 0  # actions executed without redirection
+        self.total_actions = 0  # total scheduling actions taken
+        self.step_latencies = []  # per-step wall-clock decision time (seconds)
 
         self.queue = self._gen_jobs()
         return self._obs(), {}
@@ -1102,15 +1109,22 @@ class FactoryEnv(gym.Env):
         if not self.queue:
             return self._obs(), 0.0, True, False, {}
 
+        import time as _time
+
+        _step_start = _time.perf_counter()
+
         m = int(action)
         job = self.queue[0]
         rwd = 0.0
 
-        # Penalise invalid assignment to a machine in maintenance
+        # Track action validity and penalise invalid assignment
+        self.total_actions += 1
         if self.in_maint[m]:
             rwd -= 5.0
             avail = [i for i in range(self.N_MACHINES) if self.avail[i]]
             m = min(avail, key=lambda i: self.busy_until[i]) if avail else 0
+        else:
+            self.valid_actions += 1
 
         # Compute finish time and dequeue job
         t0 = max(self.t, self.busy_until[m])
@@ -1141,6 +1155,7 @@ class FactoryEnv(gym.Env):
                     self.in_maint[i] = True
                     self.maint_done[i] = self.t + self.MAINT_DUR * 2
                     self.failures += 1
+                    self.total_maint_cost += self.COST_REACTIVE
                     rwd -= 10.0
 
             # Predictive maintenance trigger when RUL drops below threshold
@@ -1153,6 +1168,8 @@ class FactoryEnv(gym.Env):
                 self.avail[i] = False
                 self.in_maint[i] = True
                 self.maint_done[i] = self.t + self.MAINT_DUR
+                self.proactive_count += 1
+                self.total_maint_cost += self.COST_PROACTIVE
                 rwd += 2.0  # reward for proactive maintenance
 
             # Restore machines that have finished maintenance
@@ -1167,6 +1184,7 @@ class FactoryEnv(gym.Env):
             # Bonus inversely proportional to average tardiness
             rwd += max(0, 20 - self.tard / max(len(self.done_jobs), 1))
 
+        self.step_latencies.append(_time.perf_counter() - _step_start)
         return self._obs(), float(rwd), done, False, {"failures": self.failures}
 
     def _gen_jobs(self):
@@ -1205,7 +1223,10 @@ class FactoryEnv(gym.Env):
 
 
 def run_baseline_policy(policy="reactive", n_episodes=50):
-    rewards, failures, tardiness, on_time_rates, downtime_pcts = [], [], [], [], []
+    rewards, failures, tardiness = [], [], []
+    on_time_rates, downtime_pcts = [], []
+    maint_costs, auto_success_rates, mean_latencies = [], [], []
+
     for _ in range(n_episodes):
         env = FactoryEnv(use_predictive=(policy == "pred_only"))
         obs, _ = env.reset()
@@ -1217,16 +1238,17 @@ def run_baseline_policy(policy="reactive", n_episodes=50):
             if policy == "reactive":
                 action = random.choice(avail)
             elif policy == "sched_only":
-                # Greedy: pick the machine that becomes free soonest
                 action = min(avail, key=lambda m: env.busy_until[m])
             else:
                 action = random.choice(avail)
             obs, r, done, _, _ = env.step(action)
             total_r += r
+
         rewards.append(total_r)
         failures.append(env.failures)
         tardiness.append(env.tard)
-        # On-time rate: fraction of jobs completed without tardiness
+
+        # On-time rate
         n_jobs = len(env.done_jobs)
         on_time = sum(
             1
@@ -1234,15 +1256,32 @@ def run_baseline_policy(policy="reactive", n_episodes=50):
             if env.busy_until[j["type"] % env.N_MACHINES] <= j["due"]
         )
         on_time_rates.append(on_time / max(n_jobs, 1))
-        # Downtime %: total maint cycles / episode horizon
+
+        # Downtime %
         downtime_cycles = env.failures * env.MAINT_DUR * 2
         downtime_pcts.append(downtime_cycles / env.MAX_TIME * 100)
+
+        # Maintenance cost
+        maint_costs.append(env.total_maint_cost)
+
+        # Automation success rate
+        asr = env.valid_actions / max(env.total_actions, 1)
+        auto_success_rates.append(asr)
+
+        # Mean rescheduling latency (ms)
+        mean_latencies.append(
+            np.mean(env.step_latencies) * 1000 if env.step_latencies else 0.0
+        )
+
     return (
         np.mean(rewards),
         np.mean(failures),
         np.mean(tardiness),
         np.mean(on_time_rates),
         np.mean(downtime_pcts),
+        np.mean(maint_costs),
+        np.mean(auto_success_rates),
+        np.mean(mean_latencies),
         rewards,
         tardiness,
     )
@@ -1354,8 +1393,9 @@ def run_scheduling_pipeline():
     all_results = {}
 
     for name, (policy, _) in strategies.items():
-        r, f, t, otr, dtp, ep_r, ep_t = run_baseline_policy(policy, n_episodes=100)
-        # Schedule stability index: 1 - (std_tardiness / mean_tardiness)
+        r, f, t, otr, dtp, mc, asr, lat, ep_r, ep_t = run_baseline_policy(
+            policy, n_episodes=100
+        )
         ssi = 1 - (np.std(ep_t) / max(np.mean(ep_t), 1e-6))
         all_results[name] = {
             "mean_reward": r,
@@ -1364,14 +1404,19 @@ def run_scheduling_pipeline():
             "on_time_rate_%": round(otr * 100, 2),
             "downtime_%": round(dtp, 2),
             "schedule_stability_index": round(ssi, 4),
+            "mean_maint_cost": round(mc, 2),
+            "automation_success_rate_%": round(asr * 100, 2),
+            "mean_latency_ms": round(lat, 4),
         }
         print(
             f"  {name:<35} | R: {r:7.2f} | F: {f:.2f} | T: {t:.2f} "
-            f"| OTR: {otr*100:.1f}% | DT: {dtp:.1f}% | SSI: {ssi:.3f}"
+            f"| OTR: {otr*100:.1f}% | DT: {dtp:.1f}% | SSI: {ssi:.3f} "
+            f"| Cost: {mc:.1f} | ASR: {asr*100:.1f}% | Lat: {lat:.3f}ms"
         )
 
     # Evaluate PPO
-    ppo_r, ppo_f, ppo_t, ppo_otr, ppo_dtp = [], [], [], [], []
+    ppo_r, ppo_f, ppo_t = [], [], []
+    ppo_otr, ppo_dtp, ppo_mc, ppo_asr, ppo_lat = [], [], [], [], []
     for _ in range(100):
         env = FactoryEnv(use_predictive=True)
         obs, _ = env.reset()
@@ -1391,6 +1436,11 @@ def run_scheduling_pipeline():
         ppo_otr.append(on_time / max(len(env.done_jobs), 1))
         downtime_cycles = env.failures * env.MAINT_DUR * 2
         ppo_dtp.append(downtime_cycles / env.MAX_TIME * 100)
+        ppo_mc.append(env.total_maint_cost)
+        ppo_asr.append(env.valid_actions / max(env.total_actions, 1))
+        ppo_lat.append(
+            np.mean(env.step_latencies) * 1000 if env.step_latencies else 0.0
+        )
 
     ppo_ssi = 1 - (np.std(ppo_t) / max(np.mean(ppo_t), 1e-6))
     all_results["Proposed DRL-PPO (Integrated)"] = {
@@ -1400,19 +1450,24 @@ def run_scheduling_pipeline():
         "on_time_rate_%": round(np.mean(ppo_otr) * 100, 2),
         "downtime_%": round(np.mean(ppo_dtp), 2),
         "schedule_stability_index": round(ppo_ssi, 4),
+        "mean_maint_cost": round(np.mean(ppo_mc), 2),
+        "automation_success_rate_%": round(np.mean(ppo_asr) * 100, 2),
+        "mean_latency_ms": round(np.mean(ppo_lat), 4),
     }
     print(
         f"  {'Proposed DRL-PPO (Integrated)':<35} | "
         f"R: {np.mean(ppo_r):7.2f} | F: {np.mean(ppo_f):.2f} | "
         f"T: {np.mean(ppo_t):.2f} | OTR: {np.mean(ppo_otr)*100:.1f}% | "
-        f"DT: {np.mean(ppo_dtp):.1f}% | SSI: {ppo_ssi:.3f}"
+        f"DT: {np.mean(ppo_dtp):.1f}% | SSI: {ppo_ssi:.3f} | "
+        f"Cost: {np.mean(ppo_mc):.1f} | ASR: {np.mean(ppo_asr)*100:.1f}% | "
+        f"Lat: {np.mean(ppo_lat):.3f}ms"
     )
 
     # ── Statistical significance: PPO vs baselines (on reward) ───────────────
     print("\n── Scheduling Significance Tests ───────────────────────────────")
     sig_rows = []
     for name, (policy, _) in strategies.items():
-        _, _, _, _, _, ep_r_base, _ = run_baseline_policy(policy, n_episodes=100)
+        *_, ep_r_base, _ = run_baseline_policy(policy, n_episodes=100)
         stat, p = stats.wilcoxon(ppo_r, ep_r_base, alternative="greater")
         sig_rows.append(
             {
