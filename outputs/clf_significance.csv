@@ -1,5 +1,5 @@
 baseline,proposed,W_statistic,p_value,significant
-Logistic Regression,Hybrid XGBoost-LSTM (Proposed),92292.0,0.0,Yes
-Random Forest,Hybrid XGBoost-LSTM (Proposed),134472.0,0.0,Yes
-XGBoost,Hybrid XGBoost-LSTM (Proposed),1166502.0,1.0,No
-BiLSTM,Hybrid XGBoost-LSTM (Proposed),303726.0,0.0,Yes
+Logistic Regression,Hybrid XGBoost-LSTM (Proposed),91505.0,0.0,Yes
+Random Forest,Hybrid XGBoost-LSTM (Proposed),134396.0,0.0,Yes
+XGBoost,Hybrid XGBoost-LSTM (Proposed),1167937.0,1.0,No
+BiLSTM,Hybrid XGBoost-LSTM (Proposed),287311.0,0.0,Yes
